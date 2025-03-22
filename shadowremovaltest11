@@ -1,0 +1,404 @@
+import os
+import cv2
+import torch
+import torch.nn as nn
+import torchvision.transforms as transforms
+from torch.utils.data import Dataset, DataLoader
+import logging
+import sys
+import time
+import zipfile  # For creating ZIP file
+
+# Set up detailed logging with immediate flushing
+logging.basicConfig(
+    level=logging.DEBUG,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+logging.getLogger().setLevel(logging.DEBUG)
+logging.getLogger().handlers[0].setStream(sys.stdout)
+logging.getLogger().handlers[0].flush = sys.stdout.flush
+
+# Define Dataset Class
+class ShadowRemovalDataset(Dataset):
+    def __init__(self, root_dir, transform=None):
+        self.root_dir = root_dir
+        self.transform = transform
+        
+        # Assuming test dataset has images named 0000.png to 0074.png
+        self.indices = range(0, 75)  # Adjust this range if your dataset has a different naming scheme
+        self.image_files = [f"{str(i).zfill(4)}.png" for i in self.indices]
+        
+        # Store original sizes for all images
+        self.original_sizes = []
+        self.valid_files = []
+        for fname in self.image_files:
+            fpath = os.path.join(self.root_dir, fname)
+            if os.path.exists(fpath):
+                img = cv2.imread(fpath)
+                if img is not None:
+                    self.valid_files.append(fname)
+                    self.original_sizes.append((img.shape[1], img.shape[0]))  # (width, height)
+                    logging.debug(f"Loaded {fname} with size {self.original_sizes[-1]}")
+                else:
+                    logging.warning(f"Failed to load image for size check: {fpath}")
+            else:
+                logging.warning(f"File not found: {fpath}")
+        
+        logging.debug(f"Initialized dataset with {len(self.valid_files)} valid files (out of {len(self.image_files)} expected)")
+        if len(self.valid_files) != 75:
+            logging.warning(f"Expected 75 files for test dataset, but found {len(self.valid_files)}. Proceeding with available files.")
+    
+    def __len__(self):
+        return len(self.valid_files)
+    
+    def __getitem__(self, idx):
+        try:
+            shadow_filename = self.valid_files[idx]
+            shadow_path = os.path.join(self.root_dir, shadow_filename)
+            
+            logging.debug(f"Attempting to load shadow image: {shadow_path}")
+            
+            if not os.path.exists(shadow_path):
+                logging.error(f"Shadow image not found: {shadow_path}")
+                raise ValueError(f"Shadow image not found: {shadow_path}")
+            
+            shadow_img = cv2.imread(shadow_path)
+            if shadow_img is None:
+                logging.error(f"Failed to load shadow image: {shadow_filename}")
+                raise ValueError(f"Failed to load shadow image: {shadow_filename}")
+            
+            shadow_img = cv2.cvtColor(shadow_img, cv2.COLOR_BGR2RGB)
+            logging.debug(f"Loaded shadow image: {shadow_filename}")
+            
+            if self.transform:
+                shadow_img = self.transform(shadow_img)
+            else:
+                shadow_img = transforms.ToTensor()(shadow_img)
+            
+            return shadow_img, shadow_filename, self.original_sizes[idx]
+        except Exception as e:
+            logging.error(f"Error in __getitem__ for index {idx}: {str(e)}")
+            raise
+
+# Simplified Local Self-Attention (Local SA) with Random Shuffle (R.S.)
+class LocalSelfAttention(nn.Module):
+    def __init__(self, dim, num_heads=4, window_size=8):
+        super(LocalSelfAttention, self).__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.window_size = window_size
+        self.scale = (dim // num_heads) ** -0.5
+
+        self.qkv = nn.Linear(dim, dim * 3)
+        self.proj = nn.Linear(dim, dim)
+        logging.debug(f"Initialized LocalSelfAttention with dim={dim}, num_heads={num_heads}, window_size={window_size}")
+
+    def forward(self, x):
+        try:
+            B, H, W, C = x.shape
+            logging.debug(f"LocalSelfAttention input shape: {x.shape}")
+            x = x.view(B, H // self.window_size, self.window_size, W // self.window_size, self.window_size, C)
+            x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(-1, self.window_size * self.window_size, C)
+
+            idx = torch.randperm(x.shape[1])
+            x = x[:, idx, :]
+
+            qkv = self.qkv(x).reshape(x.shape[0], x.shape[1], 3, self.num_heads, self.dim // self.num_heads).permute(2, 0, 3, 1, 4)
+            q, k, v = qkv[0], qkv[1], qkv[2]
+
+            attn = (q @ k.transpose(-2, -1)) * self.scale
+            attn = attn.softmax(dim=-1)
+            x = (attn @ v).transpose(1, 2).reshape(x.shape[0], x.shape[1], self.dim)
+
+            reverse_idx = torch.argsort(idx)
+            x = x[:, reverse_idx, :]
+
+            x = self.proj(x)
+            x = x.view(B, H // self.window_size, W // self.window_size, self.window_size, self.window_size, C)
+            x = x.permute(0, 1, 3, 2, 4, 5).contiguous().view(B, H, W, C)
+            logging.debug(f"LocalSelfAttention output shape: {x.shape}")
+            return x
+        except Exception as e:
+            logging.error(f"Error in LocalSelfAttention forward: {str(e)}")
+            raise
+
+# MLP with Structure Modeling
+class SMLP(nn.Module):
+    def __init__(self, dim):
+        super(SMLP, self).__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(dim, dim * 4),
+            nn.GELU(),
+            nn.Linear(dim * 4, dim)
+        )
+        logging.debug(f"Initialized SMLP with dim={dim}")
+
+    def forward(self, x):
+        try:
+            logging.debug(f"SMLP input shape: {x.shape}")
+            x = self.mlp(x)
+            logging.debug(f"SMLP output shape: {x.shape}")
+            return x
+        except Exception as e:
+            logging.error(f"Error in SMLP forward: {str(e)}")
+            raise
+
+# HomoBlock
+class HomoBlock(nn.Module):
+    def __init__(self, dim, num_heads=4, window_size=8):
+        super(HomoBlock, self).__init__()
+        self.norm1 = nn.LayerNorm(dim)
+        self.attn = LocalSelfAttention(dim, num_heads, window_size)
+        self.norm2 = nn.LayerNorm(dim)
+        self.smlp = SMLP(dim)
+        logging.debug(f"Initialized HomoBlock with dim={dim}, num_heads={num_heads}, window_size={window_size}")
+
+    def forward(self, x):
+        try:
+            logging.debug(f"HomoBlock input shape: {x.shape}")
+            x = x + self.attn(self.norm1(x))
+            x = x + self.smlp(self.norm2(x))
+            logging.debug(f"HomoBlock output shape: {x.shape}")
+            return x
+        except Exception as e:
+            logging.error(f"Error in HomoBlock forward: {str(e)}")
+            raise
+
+# HomoFormer Model
+class HomoFormer(nn.Module):
+    def __init__(self, in_channels=3, out_channels=3, dim=32, num_levels=2):
+        super(HomoFormer, self).__init__()
+        self.num_levels = num_levels
+
+        self.input_proj = nn.Conv2d(in_channels, dim, kernel_size=3, padding=1)
+
+        self.down_blocks = nn.ModuleList()
+        self.down_convs = nn.ModuleList()
+        current_dim = dim
+        for i in range(num_levels):
+            self.down_blocks.append(HomoBlock(current_dim))
+            self.down_convs.append(nn.Conv2d(current_dim, current_dim * 2, kernel_size=3, stride=2, padding=1))
+            current_dim *= 2
+
+        self.bottleneck = HomoBlock(current_dim)
+
+        self.up_blocks = nn.ModuleList()
+        self.up_convs = nn.ModuleList()
+        for i in range(num_levels):
+            self.up_convs.append(nn.ConvTranspose2d(current_dim, current_dim // 2, kernel_size=2, stride=2))
+            current_dim //= 2
+            self.up_blocks.append(HomoBlock(current_dim))
+
+        self.output_proj = nn.Conv2d(dim, out_channels, kernel_size=3, padding=1)
+        logging.debug(f"Initialized HomoFormer with in_channels={in_channels}, out_channels={out_channels}, dim={dim}, num_levels={num_levels}")
+
+    def forward(self, x):
+        try:
+            logging.debug(f"HomoFormer input shape: {x.shape}")
+            x = self.input_proj(x)
+            B, C, H, W = x.shape
+            x = x.permute(0, 2, 3, 1)
+
+            skips = []
+            for i in range(self.num_levels):
+                logging.debug(f"Downsampling level {i+1}")
+                x = self.down_blocks[i](x)
+                skips.append(x)
+                x = x.permute(0, 3, 1, 2)
+                x = self.down_convs[i](x)
+                B, C, H, W = x.shape
+                x = x.permute(0, 2, 3, 1)
+
+            logging.debug("Processing bottleneck")
+            x = self.bottleneck(x)
+
+            for i in range(self.num_levels):
+                logging.debug(f"Upsampling level {i+1}")
+                x = x.permute(0, 3, 1, 2)
+                x = self.up_convs[i](x)
+                B, C, H, W = x.shape
+                x = x.permute(0, 2, 3, 1)
+                skip = skips[self.num_levels - 1 - i]
+                x = x + skip
+                x = self.up_blocks[i](x)
+
+            x = x.permute(0, 3, 1, 2)
+            x = self.output_proj(x)
+            logging.debug(f"HomoFormer output shape: {x.shape}")
+            return torch.sigmoid(x)
+        except Exception as e:
+            logging.error(f"Error in HomoFormer forward: {str(e)}")
+            raise
+
+# Function to save images with original resolution
+def save_images(output_dir, images, filenames, original_sizes):
+    try:
+        os.makedirs(output_dir, exist_ok=True)
+        logging.debug(f"Created output directory: {output_dir}")
+        
+        # Check lengths: images.shape[0] is the batch size
+        batch_size = images.shape[0]  # Get the batch size from the images tensor
+        if batch_size != len(filenames) or batch_size != len(original_sizes):
+            logging.error(f"Length mismatch: images={batch_size}, filenames={len(filenames)}, original_sizes={len(original_sizes)}")
+            raise ValueError("Length mismatch between images, filenames, and original sizes")
+        
+        # Iterate over the batch
+        for idx in range(batch_size):
+            img = images[idx]  # Extract the idx-th image from the batch
+            fname = filenames[idx]
+            orig_size = original_sizes[idx]
+            
+            output_fname = fname.replace('.png', '_out.png')
+            output_path = os.path.join(output_dir, output_fname)
+            img = img.permute(1, 2, 0).detach().cpu().numpy() * 255
+            img = img.clip(0, 255).astype('uint8')
+            # Resize to original size
+            logging.debug(f"Resizing {output_fname} to original size {orig_size}")
+            img = cv2.resize(img, orig_size, interpolation=cv2.INTER_LINEAR)
+            cv2.imwrite(output_path, cv2.cvtColor(img, cv2.COLOR_RGB2BGR), [cv2.IMWRITE_PNG_COMPRESSION, 0])
+            logging.info(f"Saved output image: {output_path} with resolution {orig_size}")
+    except Exception as e:
+        logging.error(f"Error in save_images: {str(e)}")
+        raise
+
+# Custom collate function to handle batching
+def custom_collate_fn(batch):
+    # batch is a list of tuples (shadow_img, filename, original_size)
+    # Each element in batch is the output of __getitem__
+    
+    # Separate the elements
+    shadow_imgs = [item[0] for item in batch]  # List of image tensors
+    filenames = [item[1] for item in batch]    # List of filenames
+    original_sizes = [item[2] for item in batch]  # List of original sizes
+    
+    # Stack the images into a batch tensor
+    shadow_imgs = torch.stack(shadow_imgs, dim=0)
+    
+    # Return the batched data
+    return shadow_imgs, filenames, original_sizes
+
+# Main execution for testing
+if __name__ == "__main__":
+    try:
+        # Fix for potential scipy import issue
+        !pip uninstall -y numpy scipy scikit-image
+        !pip install numpy==1.23.5 scipy==1.9.3 scikit-image==0.19.3
+
+        # Device configuration
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        logging.info(f"Using device: {device}")
+
+        # Define transform (resize for processing, but we'll resize back to original)
+        test_transform = transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((128, 128)),  # Resize for processing
+            transforms.ToTensor()
+        ])
+        logging.debug("Transform pipeline initialized")
+
+        # Path to your test dataset
+        # *** UPDATE THE TEST DATASET PATH HERE IF NEEDED ***
+        # Default assumes test dataset is at "/kaggle/input/shadowtest"
+        # Example: If your test dataset is named "my-test-data", use "/kaggle/input/my-test-data"
+        test_data_dir = "/kaggle/input/shadowtest"
+        test_dataset = ShadowRemovalDataset(test_data_dir, transform=test_transform)
+
+        # Debug dataset
+        logging.info("Checking test dataset")
+        for i in range(min(5, len(test_dataset))):
+            try:
+                shadow_img, fname, orig_size = test_dataset[i]
+                logging.info(f"Successfully loaded {fname} with original size {orig_size}")
+            except ValueError as e:
+                logging.error(f"Error loading test dataset item {i}: {e}")
+                raise
+        
+        # Use the custom collate function in the DataLoader
+        test_loader = DataLoader(test_dataset, batch_size=4, shuffle=False, num_workers=0, collate_fn=custom_collate_fn)
+        logging.info("DataLoader initialized")
+
+        # Initialize the model
+        model = HomoFormer(in_channels=3, out_channels=3, dim=32, num_levels=2)
+        model.to(device)
+        logging.info("Model initialized")
+
+        # Load the trained model weights
+        # Path updated based on the directory structure of your dataset
+        model_path = "/kaggle/input/imageshadowremoval/pytorch/default/1/shadow_removal_model.pth"
+        if not os.path.exists(model_path):
+            logging.error(f"Model file not found: {model_path}")
+            raise FileNotFoundError(f"Model file not found: {model_path}")
+        
+        # Load the state dict
+        state_dict = torch.load(model_path, map_location=device)
+        
+        # If the model was saved with DataParallel, we need to adjust the state dict keys
+        if list(state_dict.keys())[0].startswith("module."):
+            # Remove the "module." prefix from keys
+            state_dict = {k.replace("module.", ""): v for k, v in state_dict.items()}
+        
+        model.load_state_dict(state_dict)
+        logging.info(f"Loaded model weights from: {model_path}")
+
+        # Set model to evaluation mode
+        model.eval()
+        output_dir = "/kaggle/working/test_output"  # Output directory for deshadowed images
+        logging.info("Starting test phase")
+        
+        test_start_time = time.time()
+        processed_images = 0
+        with torch.no_grad():
+            for batch_idx, (shadow_img, filenames, original_sizes) in enumerate(test_loader):
+                try:
+                    logging.debug(f"Processing test batch {batch_idx+1}/{len(test_loader)}")
+                    shadow_img = shadow_img.to(device)
+                    output = model(shadow_img)
+                    # Debug: Log the shapes and lengths
+                    logging.debug(f"Batch {batch_idx+1}: output.shape={output.shape}, len(filenames)={len(filenames)}, len(original_sizes)={len(original_sizes)}")
+                    save_images(output_dir, output, filenames, original_sizes)
+                    processed_images += len(filenames)
+                    logging.info(f"Processed {processed_images} images so far")
+                except Exception as e:
+                    logging.error(f"Error processing batch {batch_idx+1}: {str(e)}")
+                    raise
+        test_time = time.time() - test_start_time
+        avg_time_per_image = test_time / len(test_dataset)
+        logging.info("Test phase completed")
+
+        # Verify the number of output images
+        output_files = [f for f in os.listdir(output_dir) if f.endswith('.png')]
+        logging.info(f"Number of output images generated: {len(output_files)}")
+        if len(output_files) != len(test_dataset):
+            logging.warning(f"Expected {len(test_dataset)} output images, but generated {len(output_files)}")
+
+        # Create a ZIP file containing all deshadowed images
+        zip_path = "/kaggle/working/submission.zip"
+        with zipfile.ZipFile(zip_path, 'w', zipfile.ZIP_DEFLATED) as zipf:
+            for fname in output_files:
+                file_path = os.path.join(output_dir, fname)
+                zipf.write(file_path, fname)  # Save in root of ZIP
+        logging.info(f"Created submission ZIP at: {zip_path}")
+
+        # Verify ZIP contents
+        with zipfile.ZipFile(zip_path, 'r') as zipf:
+            zip_contents = zipf.namelist()
+            logging.info(f"Contents of submission.zip: {zip_contents}")
+            png_files_in_zip = [f for f in zip_contents if f.endswith('.png')]
+            logging.info(f"Number of .png files in submission.zip: {len(png_files_in_zip)}")
+            if len(png_files_in_zip) != len(test_dataset):
+                logging.error(f"Expected {len(test_dataset)} .png files in submission.zip, but found {len(png_files_in_zip)}")
+                raise ValueError(f"Expected {len(test_dataset)} .png files in submission.zip, but found {len(png_files_in_zip)}")
+
+        # Print summary
+        print(f"Deshadowed test images saved in: {output_dir}")
+        print(f"Submission ZIP file created at: {zip_path}")
+        print(f"Average runtime per image [s]: {avg_time_per_image:.2f}")
+
+    except Exception as e:
+        logging.error(f"Error in main execution: {str(e)}")
+        raise
+    finally:
+        logging.info("Script execution completed"
